@@ -4,7 +4,7 @@ mod utils;
 use std::{
     env::{self, Args},
     ffi::CString,
-    io::{stdin, stdout, Write},
+    io::{Write, stdin, stdout},
     process::exit,
 };
 
@@ -14,10 +14,10 @@ use nix::{
     sys::{
         personality::{self, Persona},
         ptrace::{self},
-        signal::{raise, Signal},
-        wait::waitpid,
+        signal::{Signal, raise},
+        wait::{WaitStatus, waitpid},
     },
-    unistd::{execvp, fork, ForkResult, Pid},
+    unistd::{ForkResult, Pid, execvp, fork},
 };
 
 /// Launches the tracee `program` and returns its Pid.
@@ -68,14 +68,13 @@ impl BreakpointArg {
     }
 }
 
-fn run(
+fn wait_and_check(
+    waitstatus: &WaitStatus,
     child: &mut Option<Pid>,
     breakpoints: &mut Vec<Breakpoint>,
     hit_breakpoint_index: &mut Option<usize>,
 ) {
     let pid = child.unwrap();
-    ptrace::cont(pid, None).unwrap();
-    let waitstatus = waitpid(pid, None).unwrap();
     match waitstatus {
         nix::sys::wait::WaitStatus::Exited(_, exitcode) => {
             println!("Program exited with exit code {exitcode}");
@@ -83,7 +82,7 @@ fn run(
             breakpoints.clear();
         }
         nix::sys::wait::WaitStatus::Stopped(_, signal) => {
-            if signal == Signal::SIGTRAP {
+            if *signal == Signal::SIGTRAP {
                 breakpoints.iter().for_each(|bp| bp.restore_data().unwrap());
                 let regs = ptrace::getregs(pid).unwrap();
                 if let Some(index) = breakpoints
@@ -100,6 +99,8 @@ fn run(
                     *hit_breakpoint_index = Some(index);
                     return;
                 }
+                println!("Program interrupted at {:#x}", regs.rip);
+                return;
             }
             println!("Program stopped : {waitstatus:#?}");
         }
@@ -115,7 +116,9 @@ fn run(
 fn prompt_force_close(pid: Pid) {
     let mut buf = String::new();
     loop {
-        println!("\nProcess {pid} is still running, are you sure you want to quit ?\nThis will kill proicess {pid}\n\nQuit ? (y/n)");
+        println!(
+            "\nProcess {pid} is still running, are you sure you want to quit ?\nThis will kill process {pid}\n\nQuit ? (y/n)"
+        );
         stdin().read_line(&mut buf).unwrap();
         match buf.as_str().trim() {
             "y" => {
@@ -194,14 +197,21 @@ fn main_loop(mut args: Args) {
                             })
                             .collect();
                         child = Some(pid);
-                        run(&mut child, &mut breakpoints, &mut hit_breakpoint_index);
+                        ptrace::cont(pid, None).unwrap();
+                        let waitstatus = waitpid(pid, None).unwrap();
+                        wait_and_check(
+                            &waitstatus,
+                            &mut child,
+                            &mut breakpoints,
+                            &mut hit_breakpoint_index,
+                        );
                     }
                     Err(errno) => println!("Error launching '{program}' : {}", errno.desc()),
                 }
             }
 
             "continue" => match child {
-                Some(_) => {
+                Some(pid) => {
                     if let Some(index) = hit_breakpoint_index {
                         breakpoints.iter_mut().enumerate().for_each(|(i, bp)| {
                             if i != index {
@@ -213,7 +223,14 @@ fn main_loop(mut args: Args) {
                     } else {
                         breakpoints.iter_mut().for_each(|bp| bp.write().unwrap());
                     }
-                    run(&mut child, &mut breakpoints, &mut hit_breakpoint_index);
+                    ptrace::cont(pid, None).unwrap();
+                    let waitstatus = waitpid(pid, None).unwrap();
+                    wait_and_check(
+                        &waitstatus,
+                        &mut child,
+                        &mut breakpoints,
+                        &mut hit_breakpoint_index,
+                    );
                 }
                 None => {
                     println!("No program running");
@@ -241,6 +258,33 @@ fn main_loop(mut args: Args) {
                     }
                 }
             }
+            "stepi" => match child {
+                Some(pid) => {
+                    let waitstatus;
+                    if let Some(index) = hit_breakpoint_index {
+                        breakpoints.iter_mut().enumerate().for_each(|(i, bp)| {
+                            if i != index {
+                                bp.write().unwrap()
+                            }
+                        });
+                        waitstatus = breakpoints.get_mut(index).unwrap().run().unwrap();
+                        hit_breakpoint_index = None
+                    } else {
+                        breakpoints.iter_mut().for_each(|bp| bp.write().unwrap());
+                        ptrace::step(pid, None).unwrap();
+                        waitstatus = waitpid(pid, None).unwrap();
+                    }
+                    wait_and_check(
+                        &waitstatus,
+                        &mut child,
+                        &mut breakpoints,
+                        &mut hit_breakpoint_index,
+                    );
+                }
+                None => {
+                    println!("No program running");
+                }
+            },
             other => {
                 println!("Unknown command '{other}'");
             }

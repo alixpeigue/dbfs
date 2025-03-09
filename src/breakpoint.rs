@@ -1,5 +1,8 @@
 use nix::{
-    sys::{ptrace, wait::waitpid},
+    sys::{
+        ptrace,
+        wait::{WaitStatus, waitpid},
+    },
     unistd::Pid,
 };
 
@@ -57,9 +60,10 @@ impl Breakpoint {
     ///
     /// To continue running the program, it is stepped by one instruction then the trap is rewritten
     ///
-    pub fn run(self: &mut Self) -> Option<()> {
+    pub fn run(self: &mut Self) -> Option<WaitStatus> {
         ptrace::step(self.thread, None).ok()?;
-        waitpid(self.thread, None).ok()?;
-        self.write()
+        let waitstatus = waitpid(self.thread, None).ok()?;
+        self.write()?;
+        Some(waitstatus)
     }
 }
